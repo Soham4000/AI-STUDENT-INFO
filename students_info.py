@@ -632,6 +632,48 @@ def generate_ai_persona_narratives(profile: pd.DataFrame) -> tuple[str, bool]:
     return "\n".join(lines), False
 
 
+def build_positive_note_prompt(r: pd.Series) -> str:
+    """Used when attendance is healthy -- the goal here isn't intervention, it's a short,
+    specific, genuine note of encouragement/reinforcement grounded in this student's data."""
+    return f"""You are writing a short, warm note of encouragement for a student whose attendance
+is healthy -- there is NO problem to flag here. Use ONLY the facts below; do not invent details.
+
+Student profile:
+- Predicted final score: {r['Predicted_Score']:.1f}/100
+- Risk level: {r['Risk_Level']}
+- Learning persona (from clustering): {r['Persona']}
+- Study hours/week: {r['Study_Hours_per_week']:.1f}
+- Attendance: {r['Attendance_Percent']:.0f}%
+- Sleep hours/night: {r['Sleep_Hours']:.1f}
+- Extracurricular score: {r['Extracurricular_Score']:.1f}
+
+Write 2-3 sentences, under 60 words total:
+1. Name ONE specific thing in the data that's genuinely working well for this student (not
+   generic praise -- point at an actual number or pattern).
+2. If there's one small, low-effort thing that could still be even better (e.g. sleep a little
+   low, or study hours creeping into cramming territory), mention it gently as an optional
+   nudge -- not as a problem, since attendance itself is fine.
+Keep the tone encouraging and specific, never clinical or alarmist.
+"""
+
+
+def generate_ai_positive_note(r: pd.Series) -> tuple[str, bool]:
+    """Same graceful-fallback pattern as the other GenAI helpers, for the 'attendance is
+    fine' case -- reinforcement instead of intervention."""
+    client = genai_client()
+    if client is not None:
+        try:
+            resp = client.models.generate_content(model=GENAI_MODEL, contents=build_positive_note_prompt(r))
+            text = (resp.text or "").strip()
+            if text:
+                return text, True
+        except Exception:
+            pass
+    fallback = (f"Attendance is healthy at {r['Attendance_Percent']:.0f}%, and the predicted score "
+               f"({r['Predicted_Score']:.1f}) reflects that consistency. Keep up the current routine.")
+    return fallback, False
+
+
 def build_cluster_attendance_prompt(persona_counts: pd.DataFrame) -> str:
     """persona_counts: personas (rows) x attendance-reason signal (cols), student counts."""
     table_txt = persona_counts.to_string()
@@ -1004,7 +1046,15 @@ def run_dashboard():
                     st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based plan instead:")
                 st.markdown(plan)
         else:
-            st.caption("Attendance is at a healthy level for this student, so no attendance-related suggestion is needed.")
+            st.caption("Attendance is at a healthy level for this student -- no intervention needed.")
+            if st.button("✨ Generate AI encouragement note", key=f"genai_positive_{sid}"):
+                with st.spinner("Asking the model..."):
+                    note, used_genai = generate_ai_positive_note(r)
+                if used_genai:
+                    st.success("GenAI-generated note (live call):")
+                else:
+                    st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based note instead:")
+                st.markdown(note)
         st.markdown("**Input data for this student**")
         st.dataframe(src[src[ID_COL] == sid][[ID_COL] + RAW_FEATURES], hide_index=True, use_container_width=True)
         st.markdown("**How this student compares with their persona and the whole class**")
