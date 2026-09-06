@@ -482,13 +482,14 @@ FINAL_COLS = [ID_COL, "Predicted_Score", "At_Risk_Pred", "At_Risk_Prob", "Risk_L
 
 
 # =============================================================================
-# STEP 8B  GENAI-BASED PERSONALIZED SUPPORT PLAN (on demand, per student)
+# STEP 8B  GENAI-BASED PERSONALIZED SUPPORT PLAN (student-specific, conditional)
 # =============================================================================
-# All of the above (score, at-risk, persona, attendance-reason signal) is still rule-based --
-# fast and free to run for every student. The GenAI layer sits on top of it: given ONE
-# student's already-computed ML results, it asks an LLM to turn them into a short,
-# specific, human-readable explanation and a branch-aware intervention plan a counsellor
-# could actually use in conversation. It never replaces the ML outputs, only narrates them.
+# Gemini is called ONLY after a StudentID is selected and that student's row
+# satisfies either intervention trigger:
+#   1) Attendance_Percent < 75
+#   2) At_Risk == "Yes"
+# The complete row for that specific student is then sent to Gemini so that the
+# suggestions are personalized to that student rather than generated generically.
 GENAI_MODEL = "gemini-2.5-flash"   # if this gets retired, check https://ai.google.dev/gemini-api/docs/models
                                     # for the current default (e.g. "gemini-3-flash" or "-latest" alias)
 
@@ -538,6 +539,13 @@ def genai_client():
         return None
 
 
+def should_generate_ai(r: pd.Series) -> bool:
+    """Return True only for students who meet the requested GenAI trigger."""
+    attendance = pd.to_numeric(r.get("Attendance_Percent", np.nan), errors="coerce")
+    at_risk = str(r.get(CLF_TARGET, "")).strip().title() == "Yes"
+    return bool((pd.notna(attendance) and attendance < 75) or at_risk)
+
+
 def build_genai_prompt(r: pd.Series) -> str:
     """
     Build a personalized prompt from the student's complete profile.
@@ -552,6 +560,8 @@ def build_genai_prompt(r: pd.Series) -> str:
 Create a practical, encouraging and personalized support plan for this student.
 
 IMPORTANT RULES:
+- This student was selected because at least one trigger is true:
+  Attendance_Percent < 75 OR At_Risk == Yes.
 - Use ONLY the data supplied below.
 - Do not invent family, medical, financial, emotional, or personal circumstances.
 - Do not diagnose the student.
@@ -656,9 +666,9 @@ def generate_ai_support_plan(r: pd.Series) -> tuple[str, bool]:
             f"{r['Study_Hours_per_week']:.1f} hours/week and divide it across the week."
         )
 
-    if r["Attendance_Percent"] < ATTENDANCE_WARN:
+    if r["Attendance_Percent"] < 75:
         suggestions.append(
-            f"Attendance is {r['Attendance_Percent']:.1f}%; arrange a private check-in "
+            f"Attendance is {r['Attendance_Percent']:.1f}%, below the 75% intervention threshold; arrange a private check-in "
             "to understand the cause before choosing a formal intervention."
         )
     else:
@@ -710,7 +720,7 @@ def generate_ai_support_plan(r: pd.Series) -> tuple[str, bool]:
     )
 
     note = ""
-    if r["Attendance_Percent"] < ATTENDANCE_WARN:
+    if r["Attendance_Percent"] < 75:
         note = (
             "\n\n**Important:** The dataset does not contain the reason for absence. "
             "The attendance signal is only a hypothesis and should be confirmed privately "
@@ -871,7 +881,7 @@ def run_cli():
     ap.add_argument("--out", default="output")
     ap.add_argument("--no-plots", action="store_true")
     ap.add_argument("--genai", action="store_true",
-                    help="also print a personalized GenAI support plan for the example student "
+                    help="print a personalized GenAI support plan for the example student only if Attendance_Percent < 75 or At_Risk == Yes "
                          "(needs `pip install google-genai` + GEMINI_API_KEY; falls back to rule-based text otherwise)")
     args = ap.parse_args()
 
@@ -939,9 +949,17 @@ def run_cli():
 
     if args.genai:
         banner("STEP 8B  GENAI SUPPORT PLAN (example student)")
-        plan, used_genai = generate_ai_support_plan(r)
-        print(f"Source: {'live GenAI call' if used_genai else 'rule-based fallback (no API key / package found)'}\n")
-        print(plan)
+        if should_generate_ai(r):
+            plan, used_genai = generate_ai_support_plan(r)
+            print(f"Source: {'live GenAI call' if used_genai else 'rule-based fallback (no API key / package found)'}\n")
+            print(plan)
+        else:
+            print(
+                f"Gemini was NOT called for StudentID {r[ID_COL]} because "
+                f"Attendance_Percent={r['Attendance_Percent']:.1f}% and "
+                f"At_Risk={r.get(CLF_TARGET, 'Not provided')}. "
+                "Trigger requires Attendance_Percent < 75 OR At_Risk == Yes."
+            )
 
     if not args.no_plots:
         figs = {**eda_figures(df), **res["reg"]["figs"], **res["clf"]["figs"], **clu["figs"],
@@ -1130,7 +1148,12 @@ def run_dashboard():
         ids = st.session_state.get("view_ids", src[ID_COL].tolist()) or src[ID_COL].tolist()
         default = ids.index(214) if 214 in ids else 0
         sid = st.selectbox("StudentID", ids, index=default)
-        r = src[src[ID_COL] == sid].iloc[0]
+        # Retrieve ONLY the selected student's row.
+        student_rows = src[src[ID_COL] == sid]
+        if student_rows.empty:
+            st.error(f"StudentID {sid} was not found.")
+            st.stop()
+        r = student_rows.iloc[0]
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Predicted score", f"{r.Predicted_Score:.1f}")
         d2.metric("At risk", r.At_Risk_Pred, f"p = {r.At_Risk_Prob:.0%}")
@@ -1139,21 +1162,62 @@ def run_dashboard():
         st.markdown(f"**Risk level:** {r.Risk_Level}")
         st.markdown(f"**Why:** {r.Why}")
         st.markdown(f"**Recommendation:** {r.Recommendation}")
-        st.info("🤖 **AI Student Advisor:** Use the button below to generate suggestions from the complete student profile — study, attendance, GPA, sleep, extracurriculars, parental support, part-time work, final score and risk status.")
+        # -----------------------------------------------------------------
+        # CONDITIONAL GEMINI CALL
+        # Gemini is available ONLY when this selected student's own row has:
+        # Attendance_Percent < 75 OR At_Risk == Yes.
+        # -----------------------------------------------------------------
+        attendance_value = pd.to_numeric(r.get("Attendance_Percent", np.nan), errors="coerce")
+        at_risk_value = str(r.get(CLF_TARGET, "")).strip().title()
+        ai_trigger = should_generate_ai(r)
+
+        st.info(
+            "🤖 **AI Student Advisor:** Gemini is called only for this selected "
+            "student when **Attendance_Percent < 75% OR At_Risk = Yes**. "
+            "The student's own row is used to generate personalized suggestions."
+        )
+
         signal = r.get("Attendance_Reason_Signal", NOT_APPLICABLE)
         if signal != NOT_APPLICABLE:
-            st.caption(f"Attendance-reason signal (heuristic, not a diagnosis): **{signal.replace('_', ' ')}** -- "
-                       "based on whether study hours, prior GPA and home support are still holding up despite the absences.")
-            if st.button("🤖 Generate AI-written support plan for this student", key=f"genai_{sid}"):
-                with st.spinner("Asking the model..."):
+            st.caption(
+                f"Attendance-reason signal (heuristic, not a diagnosis): **{signal.replace('_', ' ')}** -- "
+                "based on whether study hours, prior GPA and home support are still holding up despite the absences."
+            )
+
+        if ai_trigger:
+            trigger_reasons = []
+            if pd.notna(attendance_value) and attendance_value < 75:
+                trigger_reasons.append(f"attendance {attendance_value:.1f}% < 75%")
+            if at_risk_value == "Yes":
+                trigger_reasons.append("At_Risk = Yes")
+
+            st.success(
+                f"🚨 **Gemini trigger active for StudentID {sid}:** "
+                + " OR ".join(trigger_reasons)
+            )
+
+            if st.button(
+                "🤖 Generate Gemini suggestions for this student",
+                key=f"genai_{sid}"
+            ):
+                with st.spinner(f"Generating personalized suggestions for StudentID {sid}..."):
                     plan, used_genai = generate_ai_support_plan(r)
+
                 if used_genai:
-                    st.success("GenAI-generated plan (live call):")
+                    st.success(f"Gemini-generated suggestions for StudentID {sid}:")
                 else:
-                    st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based plan instead:")
+                    st.warning(
+                        "Gemini could not be called (missing GEMINI_API_KEY or google-genai). "
+                        "Showing the personalized rule-based fallback instead."
+                    )
                 st.markdown(plan)
         else:
-            st.caption("Attendance is at a healthy level for this student, so no attendance-related suggestion is needed.")
+            st.info(
+                f"✅ **Gemini not called for StudentID {sid}.** "
+                f"Attendance_Percent = {attendance_value:.1f}% and "
+                f"At_Risk = {at_risk_value or 'Not provided'}. "
+                "The condition is Attendance_Percent < 75% OR At_Risk = Yes."
+            )
         st.markdown("**Input data for this student**")
         st.dataframe(src[src[ID_COL] == sid][[ID_COL] + RAW_FEATURES], hide_index=True, use_container_width=True)
         st.markdown("**How this student compares with their persona and the whole class**")
