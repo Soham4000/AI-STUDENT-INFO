@@ -1,8 +1,8 @@
-argparse
-base64
-gzip
-io
-os
-sys
-warnings
-pathlib
+streamlit
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+xgboost
+google-genai
