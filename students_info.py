@@ -539,53 +539,201 @@ def genai_client():
 
 
 def build_genai_prompt(r: pd.Series) -> str:
-    """Assemble the student's ML outputs (never raw PII beyond the ID) into a prompt."""
+    """
+    Build a personalized prompt from the student's complete profile.
+
+    GenAI is used only to explain the already-computed ML result and produce
+    practical study/support suggestions. It does not change the ML prediction,
+    risk flag, or final decision.
+    """
     signal = r.get("Attendance_Reason_Signal", NOT_APPLICABLE)
-    return f"""You are helping a school counsellor prepare for a conversation with one student.
-Use ONLY the facts below. Do not invent details about the student's personal life.
 
-Student profile:
+    return f"""You are an AI student-success advisor working with a school.
+Create a practical, encouraging and personalized support plan for this student.
+
+IMPORTANT RULES:
+- Use ONLY the data supplied below.
+- Do not invent family, medical, financial, emotional, or personal circumstances.
+- Do not diagnose the student.
+- Do not claim to know why attendance is low.
+- Treat the attendance-reason signal as a hypothesis that must be confirmed directly.
+- The ML outputs (predicted score, risk probability, persona) are already computed.
+  Do not change them.
+- Part-time employment may affect available study time, but do not assume that it does.
+- Give specific actions that a student and teacher/counsellor can realistically follow.
+
+COMPLETE STUDENT PROFILE
+- Student ID: {r[ID_COL]}
+- Study hours per week: {r['Study_Hours_per_week']:.1f}
+- Attendance: {r['Attendance_Percent']:.1f}%
+- Previous GPA: {r['Previous_GPA']:.2f}/4.00
+- Extracurricular score: {r['Extracurricular_Score']:.1f}/10
+- Sleep hours per night: {r['Sleep_Hours']:.1f}
+- Parental support score: {r['Parental_Support_Score']:.1f}/10
+- Part-time job: {r['Part_Time_Job']}
+- Final exam score (actual/available target): {r.get(REG_TARGET, np.nan)}
+- Recorded At_Risk label (if available): {r.get(CLF_TARGET, 'Not provided')}
+
+MODEL OUTPUTS
 - Predicted final score: {r['Predicted_Score']:.1f}/100
-- At-risk classifier: {r['At_Risk_Pred']} (probability {r['At_Risk_Prob']:.0%})
+- Predicted At_Risk: {r['At_Risk_Pred']}
+- At_Risk probability: {r['At_Risk_Prob']:.0%}
 - Risk level: {r['Risk_Level']}
-- Learning persona (from clustering): {r['Persona']}
-- Study hours/week: {r['Study_Hours_per_week']:.1f}
-- Attendance: {r['Attendance_Percent']:.0f}%
-- Previous GPA: {r['Previous_GPA']:.2f}
-- Sleep hours/night: {r['Sleep_Hours']:.1f}
-- Extracurricular score: {r['Extracurricular_Score']:.1f}
-- Parental support score: {r['Parental_Support_Score']:.1f}
-- Attendance-reason signal (heuristic, NOT a diagnosis): {REASON_SIGNAL_LABEL.get(signal, signal)}
+- Learning persona: {r['Persona']}
+- Decision flag: {r['Flag']}
+- Attendance-reason signal (heuristic): {REASON_SIGNAL_LABEL.get(signal, signal)}
+- Existing rule-based explanation: {r['Why']}
+- Existing rule-based recommendation: {r['Recommendation']}
 
-Write:
-1. A 2-3 sentence plain-language explanation of why this student was flagged.
-2. If the attendance-reason signal is "likely_valid_reason", "likely_disengagement", or
-   "unclear": give TWO short branches of intervention advice -- "If the reason turns out to
-   be valid/external (illness, family, transport, work): ..." and "If it turns out to be
-   casual disengagement: ...". If attendance isn't a concern, skip the branching and just
-   give one intervention plan.
-3. Keep the whole answer under 150 words, warm but direct, and always note that the
-   attendance-reason signal is a hypothesis to confirm with the student, not a fact.
+Return the answer in this exact structure:
+
+### Student Summary
+2 short sentences explaining the strongest positive factor and the biggest improvement area.
+
+### Personalized Suggestions
+Give 5 numbered suggestions. Make them specific to this student's numbers.
+Cover the most relevant areas among:
+1. study schedule / study hours,
+2. attendance,
+3. exam preparation / GPA,
+4. sleep and recovery,
+5. extracurricular balance,
+6. parental/mentor support,
+7. part-time job/time management.
+
+### 30-Day Action Plan
+Give 3 concrete weekly actions:
+- Week 1
+- Week 2
+- Weeks 3-4
+
+### Priority
+Choose exactly one: HIGH, MEDIUM, or LOW, and explain it in one sentence.
+
+### Important Note
+If attendance is low, explicitly say the reason is not known from the dataset and should be discussed privately with the student before punitive action.
+Keep the complete response under 280 words.
 """
 
 
 def generate_ai_support_plan(r: pd.Series) -> tuple[str, bool]:
     """
-    Returns (text, used_genai). Tries a real Gemini API call; on any failure (no key, no
-    package, network/API error) falls back to the rule-based Why/Recommendation/branch-note
-    already computed for this student, so the feature degrades gracefully rather than breaking.
+    Generate a complete personalized student-success plan with Gemini.
+
+    Falls back to a deterministic rule-based plan if Gemini is unavailable,
+    so the dashboard continues to work without an API key.
     """
     client = genai_client()
+
     if client is not None:
         try:
-            resp = client.models.generate_content(model=GENAI_MODEL, contents=build_genai_prompt(r))
+            resp = client.models.generate_content(
+                model=GENAI_MODEL,
+                contents=build_genai_prompt(r)
+            )
             text = (resp.text or "").strip()
             if text:
                 return text, True
         except Exception:
-            pass  # fall through to the rule-based fallback below
-    fallback = f"Why flagged: {r['Why']}.\n\nRecommended action: {r['Recommendation']}"
+            pass
+
+    # Strong fallback: still personalized from every major input signal.
+    suggestions = []
+
+    if r["Study_Hours_per_week"] < 10:
+        suggestions.append(
+            f"Increase study time gradually from {r['Study_Hours_per_week']:.1f} "
+            "hours/week using short, consistent sessions."
+        )
+    elif r["Study_Hours_per_week"] > 35:
+        suggestions.append(
+            f"Study time is already high ({r['Study_Hours_per_week']:.1f} h/week); "
+            "prioritize spaced revision and avoid excessive cramming."
+        )
+    else:
+        suggestions.append(
+            f"Maintain a consistent study routine around the current "
+            f"{r['Study_Hours_per_week']:.1f} hours/week and divide it across the week."
+        )
+
+    if r["Attendance_Percent"] < ATTENDANCE_WARN:
+        suggestions.append(
+            f"Attendance is {r['Attendance_Percent']:.1f}%; arrange a private check-in "
+            "to understand the cause before choosing a formal intervention."
+        )
+    else:
+        suggestions.append(
+            f"Keep attendance stable at {r['Attendance_Percent']:.1f}% and use missed "
+            "classes, if any, as a trigger for quick catch-up."
+        )
+
+    if r["Sleep_Hours"] < SLEEP_WARN:
+        suggestions.append(
+            f"Sleep is {r['Sleep_Hours']:.1f} hours/night; protect a consistent bedtime "
+            "and reduce late-night cramming."
+        )
+    else:
+        suggestions.append(
+            f"Sleep is {r['Sleep_Hours']:.1f} hours/night; keep the routine consistent "
+            "during exam preparation."
+        )
+
+    if r["Part_Time_Job"] in [1, "1", "Yes", "yes", True]:
+        suggestions.append(
+            "Because a part-time job is recorded, build study blocks around fixed work "
+            "hours and protect the highest-energy study period."
+        )
+    else:
+        suggestions.append(
+            "Use non-work hours for planned revision rather than leaving preparation "
+            "until the day before an exam."
+        )
+
+    if r["Extracurricular_Score"] >= 7:
+        suggestions.append(
+            f"Extracurricular involvement is relatively high ({r['Extracurricular_Score']:.1f}/10); "
+            "protect fixed study blocks around activities."
+        )
+    elif r["Parental_Support_Score"] < 4:
+        suggestions.append(
+            f"Parental support is relatively low ({r['Parental_Support_Score']:.1f}/10); "
+            "consider a teacher/mentor check-in as an additional support channel."
+        )
+    else:
+        suggestions.append(
+            f"Use the available support score ({r['Parental_Support_Score']:.1f}/10) "
+            "as a basis for regular encouragement and progress check-ins."
+        )
+
+    priority = "HIGH" if r["Risk_Level"] == "High Risk" else (
+        "MEDIUM" if r["Risk_Level"] == "Medium Risk" else "LOW"
+    )
+
+    note = ""
+    if r["Attendance_Percent"] < ATTENDANCE_WARN:
+        note = (
+            "\n\n**Important:** The dataset does not contain the reason for absence. "
+            "The attendance signal is only a hypothesis and should be confirmed privately "
+            "with the student before punitive action."
+        )
+
+    fallback = (
+        f"### Student Summary\n"
+        f"Student {r[ID_COL]} has a predicted final score of {r['Predicted_Score']:.1f}/100 "
+        f"and an At_Risk probability of {r['At_Risk_Prob']:.0%}. "
+        f"The main improvement opportunity should be addressed according to the "
+        f"{r['Risk_Level']} risk level and the student's {r['Persona']} learning profile.\n\n"
+        f"### Personalized Suggestions\n"
+        + "\n".join(f"{i+1}. {s}" for i, s in enumerate(suggestions))
+        + f"\n\n### 30-Day Action Plan\n"
+        f"- **Week 1:** Establish the most important routine identified above and record progress.\n"
+        f"- **Week 2:** Review study consistency, attendance and sleep; adjust the timetable.\n"
+        f"- **Weeks 3-4:** Use a practice-test/revision cycle and review progress with a teacher or mentor.\n\n"
+        f"### Priority\n**{priority}** — based on the model's current risk level and predicted outcomes."
+        f"{note}"
+    )
     return fallback, False
+
 
 
 def build_persona_narrative_prompt(profile: pd.DataFrame) -> str:
@@ -630,48 +778,6 @@ def generate_ai_persona_narratives(profile: pd.DataFrame) -> tuple[str, bool]:
              f"extracurricular {row['Extracurricular_Score']:.1f}."
              for name, row in profile.set_index("Persona").iterrows()]
     return "\n".join(lines), False
-
-
-def build_positive_note_prompt(r: pd.Series) -> str:
-    """Used when attendance is healthy -- the goal here isn't intervention, it's a short,
-    specific, genuine note of encouragement/reinforcement grounded in this student's data."""
-    return f"""You are writing a short, warm note of encouragement for a student whose attendance
-is healthy -- there is NO problem to flag here. Use ONLY the facts below; do not invent details.
-
-Student profile:
-- Predicted final score: {r['Predicted_Score']:.1f}/100
-- Risk level: {r['Risk_Level']}
-- Learning persona (from clustering): {r['Persona']}
-- Study hours/week: {r['Study_Hours_per_week']:.1f}
-- Attendance: {r['Attendance_Percent']:.0f}%
-- Sleep hours/night: {r['Sleep_Hours']:.1f}
-- Extracurricular score: {r['Extracurricular_Score']:.1f}
-
-Write 2-3 sentences, under 60 words total:
-1. Name ONE specific thing in the data that's genuinely working well for this student (not
-   generic praise -- point at an actual number or pattern).
-2. If there's one small, low-effort thing that could still be even better (e.g. sleep a little
-   low, or study hours creeping into cramming territory), mention it gently as an optional
-   nudge -- not as a problem, since attendance itself is fine.
-Keep the tone encouraging and specific, never clinical or alarmist.
-"""
-
-
-def generate_ai_positive_note(r: pd.Series) -> tuple[str, bool]:
-    """Same graceful-fallback pattern as the other GenAI helpers, for the 'attendance is
-    fine' case -- reinforcement instead of intervention."""
-    client = genai_client()
-    if client is not None:
-        try:
-            resp = client.models.generate_content(model=GENAI_MODEL, contents=build_positive_note_prompt(r))
-            text = (resp.text or "").strip()
-            if text:
-                return text, True
-        except Exception:
-            pass
-    fallback = (f"Attendance is healthy at {r['Attendance_Percent']:.0f}%, and the predicted score "
-               f"({r['Predicted_Score']:.1f}) reflects that consistency. Keep up the current routine.")
-    return fallback, False
 
 
 def build_cluster_attendance_prompt(persona_counts: pd.DataFrame) -> str:
@@ -765,7 +871,7 @@ def run_cli():
     ap.add_argument("--out", default="output")
     ap.add_argument("--no-plots", action="store_true")
     ap.add_argument("--genai", action="store_true",
-                    help="also print an LLM-generated support plan for the example student "
+                    help="also print a personalized GenAI support plan for the example student "
                          "(needs `pip install google-genai` + GEMINI_API_KEY; falls back to rule-based text otherwise)")
     args = ap.parse_args()
 
@@ -1033,6 +1139,7 @@ def run_dashboard():
         st.markdown(f"**Risk level:** {r.Risk_Level}")
         st.markdown(f"**Why:** {r.Why}")
         st.markdown(f"**Recommendation:** {r.Recommendation}")
+        st.info("🤖 **AI Student Advisor:** Use the button below to generate suggestions from the complete student profile — study, attendance, GPA, sleep, extracurriculars, parental support, part-time work, final score and risk status.")
         signal = r.get("Attendance_Reason_Signal", NOT_APPLICABLE)
         if signal != NOT_APPLICABLE:
             st.caption(f"Attendance-reason signal (heuristic, not a diagnosis): **{signal.replace('_', ' ')}** -- "
@@ -1046,15 +1153,7 @@ def run_dashboard():
                     st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based plan instead:")
                 st.markdown(plan)
         else:
-            st.caption("Attendance is at a healthy level for this student -- no intervention needed.")
-            if st.button("✨ Generate AI encouragement note", key=f"genai_positive_{sid}"):
-                with st.spinner("Asking the model..."):
-                    note, used_genai = generate_ai_positive_note(r)
-                if used_genai:
-                    st.success("GenAI-generated note (live call):")
-                else:
-                    st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based note instead:")
-                st.markdown(note)
+            st.caption("Attendance is at a healthy level for this student, so no attendance-related suggestion is needed.")
         st.markdown("**Input data for this student**")
         st.dataframe(src[src[ID_COL] == sid][[ID_COL] + RAW_FEATURES], hide_index=True, use_container_width=True)
         st.markdown("**How this student compares with their persona and the whole class**")
@@ -1092,10 +1191,18 @@ then combined into one action per student.
   toward *disengagement*, mixed signals are marked *unclear*. Each branch gets different advice -- a private,
   non-punitive check-in for the first, a formal attendance contract for the second -- instead of one blanket
   response for every low-attendance student.
-- **GenAI is a narration layer, not a decision-maker.** The ML models and the rule-based decision engine produce
+- **GenAI is a personalized support layer, not a decision-maker.** The ML models and the rule-based decision engine produce
   every number and every flag. An optional GenAI call (Student Detail tab, on demand) turns one student's already
   -computed results into a short, human-readable explanation and a branch-aware plan for a counsellor to use in
   conversation. It runs per-student, only when asked, and falls back to the rule-based text if no API key is set.
+
+### GenAI personalization inputs
+For an individual student, the AI advisor uses:
+`StudentID`, `Study_Hours_per_week`, `Attendance_Percent`, `Previous_GPA`,
+`Extracurricular_Score`, `Sleep_Hours`, `Parental_Support_Score`,
+`Part_Time_Job`, `Final_Exam_Score`, `At_Risk`, plus the system's
+predicted score, risk probability, risk level, persona and rule-based recommendation.
+The AI produces suggestions and a 30-day plan; it does not overwrite the ML outputs.
 
 ### Engineered features
 `Engagement_Index` (attendance + study + extracurricular composite), `Study_Sleep_Ratio` (cramming signature),
