@@ -489,7 +489,7 @@ FINAL_COLS = [ID_COL, "Predicted_Score", "At_Risk_Pred", "At_Risk_Prob", "Risk_L
 # student's already-computed ML results, it asks an LLM to turn them into a short,
 # specific, human-readable explanation and a branch-aware intervention plan a counsellor
 # could actually use in conversation. It never replaces the ML outputs, only narrates them.
-GENAI_MODEL = "gemini-3.7-flash"   # if this gets retired, check https://ai.google.dev/gemini-api/docs/models
+GENAI_MODEL = "gemini-2.5-flash"   # if this gets retired, check https://ai.google.dev/gemini-api/docs/models
                                     # for the current default (e.g. "gemini-3-flash" or "-latest" alias)
 
 REASON_SIGNAL_LABEL = {
@@ -586,6 +586,50 @@ def generate_ai_support_plan(r: pd.Series) -> tuple[str, bool]:
             pass  # fall through to the rule-based fallback below
     fallback = f"Why flagged: {r['Why']}.\n\nRecommended action: {r['Recommendation']}"
     return fallback, False
+
+
+def build_persona_narrative_prompt(profile: pd.DataFrame) -> str:
+    """profile: the cluster-profile table -- one row per persona with mean behavioural
+    features, headcount (n), and the persona name."""
+    table_txt = profile.to_string()
+    return f"""You are turning a K-Means cluster profile table into short, readable persona
+descriptions for a school's student-support dashboard. Below is one row per learning persona,
+with the MEAN of each behavioural feature for students in that cluster, the headcount (n), and
+the persona name already assigned from the profile.
+
+Cluster profile table (feature values are per-cluster means):
+{table_txt}
+
+For EACH persona in the table, write:
+- One short, vivid sentence capturing who this persona is, grounded in the actual numbers
+  (e.g. contrast it against the other personas -- "highest study hours but lowest sleep", etc.)
+  Do not invent facts not implied by the numbers.
+- One sentence on the single most useful thing to watch for in this group.
+
+Keep the WHOLE answer under 220 words total, formatted as a short list with the persona name in
+bold, one persona per line or short paragraph. Plain, concrete language a teacher would use --
+no jargon, no restating the raw numbers verbatim.
+"""
+
+
+def generate_ai_persona_narratives(profile: pd.DataFrame) -> tuple[str, bool]:
+    """Same graceful-fallback pattern as the other GenAI helpers, but narrates the persona
+    profile table itself into short readable descriptions."""
+    client = genai_client()
+    if client is not None:
+        try:
+            resp = client.models.generate_content(model=GENAI_MODEL,
+                                                   contents=build_persona_narrative_prompt(profile))
+            text = (resp.text or "").strip()
+            if text:
+                return text, True
+        except Exception:
+            pass
+    lines = [f"- **{name}** (n={int(row['n'])}): study {row['Study_Hours_per_week']:.1f}h/wk, "
+             f"attendance {row['Attendance_Percent']:.0f}%, sleep {row['Sleep_Hours']:.1f}h, "
+             f"extracurricular {row['Extracurricular_Score']:.1f}."
+             for name, row in profile.set_index("Persona").iterrows()]
+    return "\n".join(lines), False
 
 
 def build_cluster_attendance_prompt(persona_counts: pd.DataFrame) -> str:
@@ -864,6 +908,14 @@ def run_dashboard():
         st.success(f"Chosen k = **{clu['k']}** (silhouette is flat across 3-5, the elbow bends at 4-5, and 5 clusters give distinct, nameable profiles).")
         st.markdown("**Cluster profiles and persona names**")
         st.dataframe(clu["profile"], use_container_width=True)
+        if st.button("🤖 Generate AI persona descriptions"):
+            with st.spinner("Asking Gemini..."):
+                narrative, used_genai = generate_ai_persona_narratives(clu["profile"])
+            if used_genai:
+                st.success("GenAI-generated persona descriptions (live call):")
+            else:
+                st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the plain-text version instead:")
+            st.markdown(narrative)
         st.markdown("**Sanity check after clustering** (targets were not used to build the clusters)")
         st.dataframe(clu["check"], use_container_width=True)
         if clu["ari"] is not None:
@@ -943,14 +995,16 @@ def run_dashboard():
         if signal != NOT_APPLICABLE:
             st.caption(f"Attendance-reason signal (heuristic, not a diagnosis): **{signal.replace('_', ' ')}** -- "
                        "based on whether study hours, prior GPA and home support are still holding up despite the absences.")
-        if st.button("🤖 Generate AI-written support plan for this student", key=f"genai_{sid}"):
-            with st.spinner("Asking the model..."):
-                plan, used_genai = generate_ai_support_plan(r)
-            if used_genai:
-                st.success("GenAI-generated plan (live call):")
-            else:
-                st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based plan instead:")
-            st.markdown(plan)
+            if st.button("🤖 Generate AI-written support plan for this student", key=f"genai_{sid}"):
+                with st.spinner("Asking the model..."):
+                    plan, used_genai = generate_ai_support_plan(r)
+                if used_genai:
+                    st.success("GenAI-generated plan (live call):")
+                else:
+                    st.info("No GEMINI_API_KEY / `google-genai` package found -- showing the rule-based plan instead:")
+                st.markdown(plan)
+        else:
+            st.caption("Attendance is at a healthy level for this student, so no attendance-related suggestion is needed.")
         st.markdown("**Input data for this student**")
         st.dataframe(src[src[ID_COL] == sid][[ID_COL] + RAW_FEATURES], hide_index=True, use_container_width=True)
         st.markdown("**How this student compares with their persona and the whole class**")
@@ -1017,7 +1071,7 @@ variable also works as a fallback, e.g. for Streamlit Community Cloud's "env var
 feature above still works -- the Recommendation column and the "Why" text are always rule-based, GenAI just adds
 an optional narrated version on top.
 """)
- 
+
 
 # =============================================================================
 # ENTRY POINT: detect whether we are running under Streamlit
